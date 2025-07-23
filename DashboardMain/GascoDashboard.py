@@ -6,7 +6,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from Modules.auth import login, register, logout
-from Modules.expenses import maintenance_log_ui, show_filtered_dashboard
+from Modules.expenses import show_filtered_dashboard
 
 st.set_page_config(page_title="Gasco Dashboard", layout="wide")
 
@@ -28,11 +28,10 @@ if st.session_state.authentication_status:
     selected = st.sidebar.selectbox("Choose View", ["Log Maintenance", "Budget Dashboard"])
 
     st.write(f"# Welcome *{st.session_state.name}*")
-    st.write("✅ You are logged in. Show your dashboard here.")
+    st.write("You are logged in. Show your dashboard here.")
 
-    if selected == "Log Maintenance":
-        maintenance_log_ui()
-    elif selected == "Budget Dashboard":
+    
+    if selected == "Budget Dashboard":
         show_filtered_dashboard()
 
 # Show login/register options if not authenticated
