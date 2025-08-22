@@ -14,14 +14,17 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
+from Modules.maintenance import  solve_true_min_cost_mip, solve_true_min_cost_and_min_gap, solve_true_min_cost_and_max_gap
+
+
 
 CURRENT_YEAR = datetime.now().year
 EXCEL_PATH = "Data/Budget Monitoring.xlsx"
 
-# Budget columns for different years
 BUDGET_COLUMNS = {
     "2023": "2023 Budget",
-    "2024": "2024 Budget", 
+    "2024": "2024 Budget",
     "2025": "2025 Budget"
 }
 
@@ -29,7 +32,6 @@ CONSUMED_COL = "Consumed Amount"
 AVAILABLE_COL = "Available Amount"
 
 def get_quarter_from_date(date):
-    """Get quarter (Q1, Q2, Q3, Q4) from a date"""
     if pd.isna(date):
         return None
     month = date.month
@@ -43,48 +45,26 @@ def get_quarter_from_date(date):
         return "Q4"
 
 def get_year_from_date(date):
-    """Get year from a date"""
     if pd.isna(date):
         return None
     return date.year
 
-def load_budget_data():
-    try:
-        df = pd.read_excel(EXCEL_PATH)
-        df.columns = df.columns.str.strip()  # Remove extra spaces
+# REPLACE YOUR EXISTING load_budget_data() FUNCTION WITH THIS:
 
-        # Force numeric types for all budget columns
-        for year, col_name in BUDGET_COLUMNS.items():
-            df[col_name] = pd.to_numeric(df[col_name], errors="coerce").fillna(0)
-        
-        df[CONSUMED_COL] = pd.to_numeric(df[CONSUMED_COL], errors="coerce").fillna(0)
-        df[AVAILABLE_COL] = df[BUDGET_COLUMNS["2025"]] - df[CONSUMED_COL]
 
-        # Process date column if it exists
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df["Quarter"] = df["Date"].apply(get_quarter_from_date)
-            df["Year"] = df["Date"].apply(get_year_from_date)
-        else:
-            # If no date column, create dummy dates for 2025
-            df["Date"] = pd.to_datetime("2025-01-01")
-            df["Quarter"] = "Q1"
-            df["Year"] = 2025
-
-        return df
-    except Exception as e:
-        st.error(f"Failed to load budget data: {e}")
-        return pd.DataFrame(columns=[
-            "Cost Center Number", "Cost Center Name", "Account number",
-            "Account name", "Date", "Quarter", "Year", "2023 Budget", "2024 Budget", "2025 Budget", 
-            "Consumed Amount", "Available Amount"
-        ])
 
 def append_expense_to_excel(new_data: dict):
     try:
         df = pd.read_excel(EXCEL_PATH)
         df.columns = df.columns.str.strip()
+
         new_row = pd.DataFrame([new_data])
+
+        # Avoid duplicates
+        if ((df == new_row.iloc[0]).all(axis=1)).any():
+            st.warning("This exact record already exists.")
+            return False
+
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_excel(EXCEL_PATH, index=False, engine='openpyxl')
         return True
@@ -92,6 +72,377 @@ def append_expense_to_excel(new_data: dict):
         st.error(f"Error writing to Excel: {e}")
         return False
 
+
+def load_budget_data():
+    try:
+        df = pd.read_excel(EXCEL_PATH)
+        df.columns = df.columns.str.strip()  # clean column names
+
+        # Force numeric for budget & amount columns
+        for col in list(BUDGET_COLUMNS.values()) + [CONSUMED_COL]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        # Calculate Available
+        if AVAILABLE_COL not in df.columns:
+            df[AVAILABLE_COL] = df[BUDGET_COLUMNS["2025"]] - df[CONSUMED_COL]
+
+        # Process Date
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df["Quarter"] = df["Date"].apply(get_quarter_from_date)
+            df["Year"] = df["Date"].apply(get_year_from_date)
+        else:
+            df["Date"] = pd.to_datetime("2025-01-01")
+            df["Quarter"] = "Q1"
+            df["Year"] = 2025
+
+        # Combined cost center for dropdown
+        if "Cost Center Number" in df.columns and "Cost Center Name" in df.columns:
+            df["Cost Center Display"] = df["Cost Center Number"].astype(str) + " - " + df["Cost Center Name"]
+
+        # Combined account for dropdown
+        if "Account number" in df.columns and "Account name" in df.columns:
+            df["Account Display"] = df["Account number"].astype(str) + " - " + df["Account name"]
+
+        # Extract unique values for the expected return
+        cost_center_names = sorted(df["Cost Center Name"].dropna().unique().tolist()) if "Cost Center Name" in df.columns else []
+        cost_center_numbers = sorted(df["Cost Center Number"].dropna().unique().tolist()) if "Cost Center Number" in df.columns else []
+        account_names = sorted(df["Account name"].dropna().unique().tolist()) if "Account name" in df.columns else []
+        account_numbers = sorted(df["Account number"].dropna().unique().tolist()) if "Account number" in df.columns else []
+
+        return df, cost_center_names, cost_center_numbers, account_names, account_numbers
+        
+    except Exception as e:
+        st.error(f"Failed to load budget data: {e}")
+        # Return empty values for all expected returns
+        return pd.DataFrame(), [], [], [], []
+
+def log_expense_form():
+    df, _, _, _, _ = load_budget_data()
+    if df.empty:
+        return
+
+    with st.form("log_expense_form"):
+        # Step 1: Select Cost Center (combined name + number)
+        selected_cc_display = st.selectbox("Cost Center", sorted(df["Cost Center Display"].unique()))
+        cc_row = df[df["Cost Center Display"] == selected_cc_display].iloc[0]
+        selected_cc_number = cc_row["Cost Center Number"]
+        selected_cc_name = cc_row["Cost Center Name"]
+
+        # Step 2: Select Account (combined number + name)
+        filtered_acc_displays = df[df["Cost Center Display"] == selected_cc_display]["Account Display"].dropna().unique().tolist()
+        selected_acc_display = st.selectbox("Select Account", sorted(filtered_acc_displays))
+        
+        # Extract account number and name from the selected display
+        acc_row = df[
+            (df["Cost Center Display"] == selected_cc_display) &
+            (df["Account Display"] == selected_acc_display)
+        ].iloc[0]
+        selected_acc_number = acc_row["Account number"]
+        selected_acc_name = acc_row["Account name"]
+
+        # Step 3: Date
+        date_val = st.date_input("Date", pd.Timestamp.today())
+
+        # Step 4: Budget info
+        match = df[
+            (df["Cost Center Number"] == selected_cc_number) &
+            (df["Cost Center Name"] == selected_cc_name) &
+            (df["Account name"] == selected_acc_name) &
+            (df["Account number"] == selected_acc_number)
+        ]
+
+        budget_2025 = match["2025 Budget"].iloc[0] if not match.empty else 0
+        consumed_before = match["Consumed Amount"].iloc[0] if not match.empty else 0
+        available_before = match["Available Amount"].iloc[0] if not match.empty else 0
+
+        st.write(f"**2025 Budget:** {budget_2025}")
+        st.write(f"**Consumed Before:** {consumed_before}")
+        st.write(f"**Available Before:** {available_before}")
+
+        consumed_now = st.number_input("Consumed Amount", min_value=0.0, step=0.01)
+        available_after = available_before - consumed_now
+        st.write(f"**Available After:** {available_after}")
+
+        submitted = st.form_submit_button("Submit Expense")
+        if submitted:
+            new_row = {
+                "Cost Center Number": selected_cc_number,
+                "Cost Center Name": selected_cc_name,
+                "Account number": selected_acc_number,
+                "Account name": selected_acc_name,
+                "Date": date_val,
+                "Quarter": get_quarter_from_date(date_val),
+                "Year": date_val.year,
+                "2023 Budget": match["2023 Budget"].iloc[0] if not match.empty else 0,
+                "2024 Budget": match["2024 Budget"].iloc[0] if not match.empty else 0,
+                "2025 Budget": budget_2025,
+                "Consumed Amount": consumed_now,
+                "Available Amount": available_after
+            }
+            if append_expense_to_excel(new_row):
+                st.success("Expense logged successfully.")
+
+def show_filtered_dashboard():
+    st.title("📊 Budget Dashboard")
+
+    # ------------------ 📥 Load Data First ------------------
+    df, cost_center_names, cost_center_numbers, account_names, account_numbers = load_budget_data()
+    if df.empty:
+        st.warning("No data available to display.")
+        return
+
+    # ------------------ 🔧 Log Expense ------------------
+    with st.expander("➕ Log New Expense", expanded=True):
+        # STEP 1: Cost Center selection OUTSIDE the form (so it can update dynamically)
+        if "Cost Center Display" in df.columns and not df.empty:
+            cost_center_options = sorted(df["Cost Center Display"].dropna().unique())
+            
+            if cost_center_options:
+                selected_cc_display = st.selectbox(
+                    "🏢 Select Cost Center", 
+                    cost_center_options,
+                    key="cost_center_selector"
+                )
+                
+                # Get the selected cost center details
+                cc_rows = df[df["Cost Center Display"] == selected_cc_display]
+                if not cc_rows.empty:
+                    selected_cc_number = cc_rows["Cost Center Number"].iloc[0]
+                    selected_cc_name = cc_rows["Cost Center Name"].iloc[0]
+                    filtered_acc_displays = cc_rows["Account Display"].dropna().unique().tolist()
+                    if filtered_acc_displays:
+                        with st.form("log_expense_form_main"):
+                            selected_acc_display = st.selectbox("📊 Select Account", sorted(filtered_acc_displays), key="account_display_selector")
+                            acc_row = cc_rows[cc_rows["Account Display"] == selected_acc_display].iloc[0]
+                            selected_acc_number = acc_row["Account number"]
+                            selected_acc_name = acc_row["Account name"]
+                            expense_date = st.date_input("📅 Expense Date", value=datetime.now())
+                            match = df[(df["Cost Center Number"] == selected_cc_number) & (df["Cost Center Name"] == selected_cc_name) & (df["Account name"] == selected_acc_name) & (df["Account number"] == selected_acc_number)]
+                            if not match.empty:
+                                budget_2025 = match["2025 Budget"].iloc[0] if "2025 Budget" in match.columns else 0
+                                budget_2024 = match["2024 Budget"].iloc[0] if "2024 Budget" in match.columns else 0
+                                budget_2023 = match["2023 Budget"].iloc[0] if "2023 Budget" in match.columns else 0
+                                consumed_before = match[CONSUMED_COL].iloc[0] if CONSUMED_COL in match.columns else 0
+                                available_before = match[AVAILABLE_COL].iloc[0] if AVAILABLE_COL in match.columns else budget_2025
+                                st.markdown("**📈 Current Budget Status:**")
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("2025 Budget", f"${budget_2025:,.2f}")
+                                with col2:
+                                    st.metric("Consumed", f"${consumed_before:,.2f}")
+                                with col3:
+                                    st.metric("Available", f"${available_before:,.2f}")
+                                consumed_now = st.number_input("💰 New Expense Amount", min_value=0.0, step=0.01, help="Enter the amount you want to log as consumed")
+                                if consumed_now > 0:
+                                    new_consumed_total = consumed_before + consumed_now
+                                    available_after = budget_2025 - new_consumed_total
+                                    st.markdown("**📊 After This Expense:**")
+                                    col1a, col2a = st.columns(2)
+                                    with col1a:
+                                        st.write(f"**Total Consumed:** ${new_consumed_total:,.2f}")
+                                    with col2a:
+                                        st.write(f"**Available:** ${available_after:,.2f}")
+                                    if available_after < 0:
+                                        st.error("⚠️ This expense will exceed the available budget!")
+                                    elif available_after < (budget_2025 * 0.1):
+                                        st.warning("⚠️ Low budget remaining!")
+                                form_data = {'selected_cc_number': selected_cc_number, 'selected_cc_name': selected_cc_name, 'selected_acc_name': selected_acc_name, 'selected_acc_number': selected_acc_number, 'expense_date': expense_date, 'consumed_now': consumed_now, 'budget_2025': budget_2025, 'budget_2024': budget_2024, 'budget_2023': budget_2023, 'consumed_before': consumed_before}
+                            else:
+                                st.error("❌ No exact match found for the selected combination.")
+                                consumed_now = 0
+                                form_data = {}
+                            submit = st.form_submit_button("📝 Log Expense", type="primary")
+                        if submit and 'form_data' in locals() and form_data and consumed_now > 0:
+                            try:
+                                new_consumed_total = form_data['consumed_before'] + form_data['consumed_now']
+                                available_after = form_data['budget_2025'] - new_consumed_total
+                                row = {"Cost Center Number": form_data['selected_cc_number'], "Cost Center Name": form_data['selected_cc_name'], "Account number": form_data['selected_acc_number'], "Account name": form_data['selected_acc_name'], "Date": form_data['expense_date'], "Quarter": get_quarter_from_date(form_data['expense_date']), "Year": form_data['expense_date'].year, "2023 Budget": form_data['budget_2023'], "2024 Budget": form_data['budget_2024'], "2025 Budget": form_data['budget_2025'], CONSUMED_COL: new_consumed_total, AVAILABLE_COL: available_after}
+                                success = append_expense_to_excel(row)
+                                if success:
+                                    st.success("✅ Expense logged and saved successfully!")
+                                    st.balloons()
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Failed to log the expense. Please try again.")
+                            except Exception as e:
+                                st.error(f"❌ Error logging expense: {str(e)}")
+                        elif submit and consumed_now <= 0:
+                            st.warning("⚠️ Please enter an expense amount greater than 0.")
+
+    tab1, tab2 = st.tabs(["📊 Analysis Dashboard", "📋 Summary & Insights"])
+    with tab1:
+        st.markdown("---")
+        st.subheader("🎯 Filters")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            time_period = st.selectbox("Select Time Period Type", options=["Annual", "Quarterly"], help="Choose between annual or quarterly analysis")
+        with col2:
+            if time_period == "Annual":
+                selected_years = st.multiselect("Select Years to Compare", options=list(BUDGET_COLUMNS.keys()), default=["2025", "2024", "2023"])
+            else:
+                available_years = sorted(df["Year"].unique()) if "Year" in df.columns else []
+                if available_years:
+                    selected_year = st.selectbox("Select Year for Quarterly Analysis", options=available_years, index=len(available_years) - 1)
+                    selected_quarters = st.multiselect("Select Quarters to Compare", options=["Q1", "Q2", "Q3", "Q4"], default=["Q1", "Q2", "Q3", "Q4"])
+                else:
+                    selected_year, selected_quarters = None, []
+        with col3:
+            cc_options = ["All"] + cost_center_names
+            selected_ccs = st.multiselect("Select Cost Centers", options=cc_options, default=["All"])
+        
+        # Filter by Cost Center
+        if "All" in selected_ccs or not selected_ccs:
+            filtered_df = df
+        else:
+            filtered_df = df[df["Cost Center Name"].isin(selected_ccs)]
+
+        # Filter by Account
+        account_options = ["All"] + sorted(filtered_df["Account name"].unique())
+        selected_accounts = st.multiselect("Select Accounts", options=account_options, default=["All"])
+        if "All" not in selected_accounts and selected_accounts:
+            filtered_df = filtered_df[filtered_df["Account name"].isin(selected_accounts)]
+        st.markdown("---")
+        if time_period == "Annual":
+            if "All" not in selected_accounts and selected_accounts:
+                st.subheader("Consumed vs. Available Budget")
+                account_summary = filtered_df.groupby(["Cost Center Name", "Account name"]) [[CONSUMED_COL, AVAILABLE_COL]].sum().reset_index()
+                melted_data = pd.melt(account_summary, id_vars=["Cost Center Name", "Account name"], value_vars=[CONSUMED_COL, AVAILABLE_COL], var_name="Budget Type", value_name="Amount")
+                if not melted_data.empty:
+                    fig_con_avail = px.bar(melted_data, x="Account name", y="Amount", color="Budget Type", barmode="group", title="Consumed vs. Available by Account", color_discrete_map={CONSUMED_COL: '#d62728', AVAILABLE_COL: '#2ca02c'}, text="Amount", facet_col="Cost Center Name", facet_col_wrap=4)
+                    fig_con_avail.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+                    fig_con_avail.update_layout(yaxis_title="Amount ($)")
+                    st.plotly_chart(fig_con_avail, use_container_width=True)
+            if not selected_years:
+                st.warning("Please select at least one year.")
+            else:
+                st.subheader("📈 Annual Budget Comparison")
+                annual_data = []
+                # Use full dataframe if no cost centers are selected, otherwise use the filtered one
+                source_df = df if not selected_ccs else filtered_df
+                for year in selected_years:
+                    budget_col = BUDGET_COLUMNS.get(str(year))
+                    if budget_col and budget_col in source_df.columns:
+                        if not selected_ccs:
+                            # Total budget per year if no CC is selected
+                            total_budget = source_df[budget_col].sum()
+                            annual_data.append({'Year': year, 'Budget': total_budget})
+                        else:
+                            # Budget per selected CC per year
+                            yearly_sum = source_df.groupby("Cost Center Name")[budget_col].sum().reset_index()
+                            yearly_sum.rename(columns={budget_col: 'Budget'}, inplace=True)
+                            yearly_sum['Year'] = year
+                            annual_data.append(yearly_sum)
+                
+                if annual_data:
+                    annual_df = pd.concat([pd.DataFrame([x]) if isinstance(x, dict) else x for x in annual_data], ignore_index=True)
+                    if not annual_df.empty and annual_df['Budget'].sum() > 0:
+                        if not selected_ccs:
+                            fig_annual = px.bar(annual_df, x='Year', y='Budget', title='Total Annual Budget Comparison', text='Budget')
+                            fig_annual.update_traces(texttemplate='$%{text:,.2s}', textposition='outside')
+                        else:
+                            fig_annual = px.bar(annual_df, x='Year', y='Budget', color='Cost Center Name', barmode='group', title='Annual Budget Comparison by Cost Center')
+                        st.plotly_chart(fig_annual, use_container_width=True)
+
+                        # --- Annual Trend Line Chart ---
+                        st.subheader("📈 Annual Budget Trend")
+                        if not selected_ccs:
+                            fig_annual_trend = px.line(annual_df, x='Year', y='Budget', title='Total Annual Budget Trend', markers=True)
+                        else:
+                            fig_annual_trend = px.line(annual_df, x='Year', y='Budget', color='Cost Center Name', title='Annual Budget Trend by Cost Center', markers=True)
+                        fig_annual_trend.update_traces(textposition="top center")
+                        st.plotly_chart(fig_annual_trend, use_container_width=True)
+
+                # --- Chart by Account --- 
+                if selected_accounts:
+                    st.subheader("📊 Annual Budget by Account")
+                    account_annual_data = []
+                    for year in selected_years:
+                        budget_col = BUDGET_COLUMNS.get(str(year))
+                        if budget_col and budget_col in filtered_df.columns:
+                            year_data = filtered_df.groupby(["Cost Center Name", "Account name"])[budget_col].sum().reset_index()
+                            year_data.rename(columns={budget_col: 'Budget'}, inplace=True)
+                            year_data['Year'] = year
+                            account_annual_data.append(year_data)
+                    
+                    if account_annual_data:
+                        account_df = pd.concat(account_annual_data, ignore_index=True)
+                        if not account_df.empty and account_df['Budget'].sum() > 0:
+                            fig_accounts = px.bar(account_df, x="Account name", y="Budget", color="Year", barmode="group",
+                                                  title="Annual Budget by Account", facet_col="Cost Center Name", facet_col_wrap=4)
+                            st.plotly_chart(fig_accounts, use_container_width=True)
+        else:  # Quarterly Analysis
+            if not selected_quarters or selected_year is None:
+                st.warning("Please select a year and at least one quarter.")
+            else:
+                st.subheader(f"📈 {selected_year} Quarterly Consumption Trend")
+                budget_col = BUDGET_COLUMNS.get(str(selected_year))
+                if budget_col and budget_col in filtered_df.columns:
+                    quarter_filtered = filtered_df[(filtered_df["Year"] == selected_year) & (filtered_df["Quarter"].isin(selected_quarters))].copy()
+                    
+                    if not quarter_filtered.empty:
+                        # Ensure quarters are sorted correctly
+                        quarter_order = [f'Q{i}' for i in range(1, 5)]
+                        quarter_filtered['Quarter'] = pd.Categorical(quarter_filtered['Quarter'], categories=quarter_order, ordered=True)
+                        
+                        # Aggregate data for consumption
+                        quarterly_consumed_agg = quarter_filtered.groupby(["Cost Center Name", "Account name", "Quarter"])[CONSUMED_COL].sum().reset_index()
+                        
+                        if not quarterly_consumed_agg.empty and quarterly_consumed_agg[CONSUMED_COL].sum() > 0:
+                            fig_quarterly_trend = px.line(
+                                quarterly_consumed_agg,
+                                x='Quarter',
+                                y=CONSUMED_COL,
+                                color='Account name',
+                                markers=True,
+                                title=f'Quarterly Consumption Trend for {selected_year}',
+                                facet_col="Cost Center Name",
+                                facet_col_wrap=4
+                            )
+                            st.plotly_chart(fig_quarterly_trend, use_container_width=True)
+
+                            # --- Quarterly Consumed Amount Bar Chart ---
+                            st.subheader(f'📊 {selected_year} Consumed Amount by Quarter')
+                            consumed_agg = quarter_filtered.groupby(["Cost Center Name", "Account name", "Quarter"])[CONSUMED_COL].sum().reset_index()
+                            if not consumed_agg.empty and consumed_agg[CONSUMED_COL].sum() > 0:
+                                fig_consumed_bar = px.bar(
+                                    consumed_agg,
+                                    x='Account name',
+                                    y=CONSUMED_COL,
+                                    color='Quarter',
+                                    barmode='group',
+                                    title=f'Consumed Amount for {selected_year}',
+                                    facet_col="Cost Center Name",
+                                    facet_col_wrap=4
+                                )
+                                st.plotly_chart(fig_consumed_bar, use_container_width=True)
+                            else:
+                                st.info("No consumption data to display for the selected period.")
+
+                            # --- Consumed Amount by Cost Center Bar Chart ---
+                            st.subheader(f'📊 {selected_year} Consumed Amount by Cost Center')
+                            consumed_by_cc = quarter_filtered.groupby("Cost Center Name")[CONSUMED_COL].sum().reset_index()
+                            if not consumed_by_cc.empty and consumed_by_cc[CONSUMED_COL].sum() > 0:
+                                fig_consumed_cc_bar = px.bar(
+                                    consumed_by_cc,
+                                    x='Cost Center Name',
+                                    y=CONSUMED_COL,
+                                    title=f'Consumed Amount by Cost Center for {selected_year}',
+                                    text=CONSUMED_COL
+                                )
+                                fig_consumed_cc_bar.update_traces(texttemplate='$%{text:,.2s}', textposition='outside')
+                                st.plotly_chart(fig_consumed_cc_bar, use_container_width=True)
+                        else:
+                            st.info("No budget data to display for the selected quarterly period.")
+                    else:
+                        st.info("No data available for the selected quarters.")
+        st.markdown("---")
+        st.subheader("📋 Detailed Data View")
+        st.dataframe(filtered_df)
+    
+    with tab2:
+        show_summary_tab(df)
 def generate_report(df):
     """Generate a comprehensive PDF report"""
     try:
@@ -580,7 +931,7 @@ def show_summary_tab(df):
         st.write("**🚨 Critical Alarms:**")
         
         # High consumption alarms
-        high_consumption = df[df[CONSUMED_COL] / df["2025 Budget"] > 0.9]
+        high_consumption = df[(df["2025 Budget"] > 0) & (df[CONSUMED_COL] / df["2025 Budget"] > 0.9)]
         if len(high_consumption) > 0:
             st.error(f"🔥 High Consumption Alert: {len(high_consumption)} items >90% consumed")
             for _, row in high_consumption.head(3).iterrows():
@@ -694,372 +1045,96 @@ def show_summary_tab(df):
             st.error("📉 Consistent Decline Trend")
         else:
             st.warning("📊 Mixed Growth Pattern")
-    
 
+def show_optimizer_dashboard():
+	st.title("⚙️ Compressor Optimization")
 
-def show_filtered_dashboard():
-    st.title("📊 Budget Dashboard")
+	# Persist results so multiple runs can be viewed together
+	if 'opt_results' not in st.session_state:
+		st.session_state.opt_results = {}
 
-    # ------------------ 🔧 Log Expense ------------------
-    with st.expander("➕ Log New Expense", expanded=True):
-        with st.form("log_expense_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                cost_center_number = st.text_input("Cost Center Number")
-                account_number = st.text_input("Account Number")
-                budget_2025 = st.number_input("2025 Budget", min_value=0.0, value=0.0)
-            with col2:
-                cost_center_name = st.text_input("Cost Center Name")
-                account_name = st.text_input("Account Name")
-                consumed = st.number_input("Consumed Amount", min_value=0.0, value=0.0)
-            with col3:
-                budget_2024 = st.number_input("2024 Budget", min_value=0.0, value=0.0)
-                budget_2023 = st.number_input("2023 Budget", min_value=0.0, value=0.0)
-                expense_date = st.date_input("Expense Date", value=datetime.now())
-                submit = st.form_submit_button("Log Expense")
+	# Gap trade-off for models 2 and 3
+	lambda_val = st.slider("Gap trade-off (lambda)", min_value=0.0, max_value=1.0, value=0.1, step=0.05, help="Higher values weight the gap objective more strongly")
 
-        if submit:
-            available = budget_2025 - consumed
-            row = {
-                "Cost Center Number": cost_center_number,
-                "Cost Center Name": cost_center_name,
-                "Account number": account_number,
-                "Account name": account_name,
-                "Date": expense_date,
-                "2023 Budget": budget_2023,
-                "2024 Budget": budget_2024,
-                "2025 Budget": budget_2025,
-                CONSUMED_COL: consumed,
-                AVAILABLE_COL: available
-            }
+	# Run-all control
+	run_all = st.button("Run All Models", type="primary")
 
-            success = append_expense_to_excel(row)
-            if success:
-                st.success("Expense logged and saved.")
-            else:
-                st.error("Failed to log the expense.")
+	col1, col2, col3 = st.columns(3)
 
-    # ------------------ 📥 Load Updated Excel ------------------
-    df = load_budget_data()
-    if df.empty:
-        st.warning("No data available to display.")
-        return
+	with col1:
+		if st.button("Run Model 1: Minimize Cost") or run_all:
+			df1 = solve_true_min_cost_mip()
+			total_hours = float(df1['Assigned Hours'].sum()) if 'Assigned Hours' in df1.columns else 0.0
+			total_cost = float(df1['Exact Cost'].sum()) if 'Exact Cost' in df1.columns else 0.0
+			st.session_state.opt_results['m1'] = {
+				'df': df1,
+				'total_hours': total_hours,
+				'total_cost': total_cost
+			}
 
-    # ------------------ 📑 Tabbed Interface ------------------
-    tab1, tab2 = st.tabs(["📊 Analysis Dashboard", "📋 Summary & Insights"])
-    
-    with tab1:
-        # ------------------ 🎯 Advanced Filters ------------------
-        st.markdown("---")
-        st.subheader("🎯 Filters")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            # Time period selection
-            time_period = st.selectbox(
-                "Select Time Period Type",
-                options=["Annual", "Quarterly"],
-                help="Choose between annual or quarterly analysis"
-            )
-        
-        with col2:
-            if time_period == "Annual":
-                # Multi-year selection for annual data
-                selected_years = st.multiselect(
-                    "Select Years to Compare", 
-                    options=list(BUDGET_COLUMNS.keys()),
-                    default=["2025", "2024", "2023"]
-                )
-            else:
-                # Year selection for quarterly data
-                available_years = sorted(df["Year"].unique())
-                selected_year = st.selectbox(
-                    "Select Year for Quarterly Analysis",
-                    options=available_years,
-                    index=len(available_years)-1 if available_years else 0
-                )
-                selected_quarters = st.multiselect(
-                    "Select Quarters to Compare",
-                    options=["Q1", "Q2", "Q3", "Q4"],
-                    default=["Q1", "Q2", "Q3", "Q4"]
-                )
-        
-        with col3:
-            cost_centers = ["All"] + sorted(df["Cost Center Name"].unique())
-            selected_cc = st.selectbox("Select Cost Center", options=cost_centers)
+	with col2:
+		if st.button("Run Model 2: Cost + Max Gap") or run_all:
+			df2, gap2, total_cost2 = solve_true_min_cost_and_max_gap(lambda_gap=lambda_val)
+			total_hours2 = float(df2['Assigned Hours'].sum()) if 'Assigned Hours' in df2.columns else 0.0
+			st.session_state.opt_results['m2'] = {
+				'df': df2,
+				'total_hours': total_hours2,
+				'total_cost': float(total_cost2),
+				'gap': float(gap2),
+				'lambda': lambda_val
+			}
 
-        # Filter data based on selections
-        filtered_df = df.copy()
-        if selected_cc != "All":
-            filtered_df = filtered_df[filtered_df["Cost Center Name"] == selected_cc]
+	with col3:
+		if st.button("Run Model 3: Cost + Min Gap") or run_all:
+			df3, gap3, total_cost3 = solve_true_min_cost_and_min_gap(lambda_gap=lambda_val)
+			total_hours3 = float(df3['Assigned Hours'].sum()) if 'Assigned Hours' in df3.columns else 0.0
+			st.session_state.opt_results['m3'] = {
+				'df': df3,
+				'total_hours': total_hours3,
+				'total_cost': float(total_cost3),
+				'gap': float(gap3),
+				'lambda': lambda_val
+			}
 
-        # ------------------ 🔢 KPI Summary ------------------
-        if time_period == "Annual":
-            if not selected_years:
-                st.warning("Please select at least one year to display data.")
-                return
-            
-            # Get the primary year for KPI calculations
-            primary_year = selected_years[0]
-            primary_budget_col = BUDGET_COLUMNS[primary_year]
-            
-            total_budget = filtered_df[primary_budget_col].sum()
-            total_consumed = filtered_df[CONSUMED_COL].sum()
-            total_remaining = filtered_df[AVAILABLE_COL].sum()
+	st.markdown("---")
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric(f"{primary_year} Total Budget", f"{total_budget:,.0f}")
-            col2.metric("Total Consumed", f"{total_consumed:,.0f}")
-            col3.metric("Total Remaining", f"{total_remaining:,.0f}")
-            
-        else:
-            if not selected_quarters:
-                st.warning("Please select at least one quarter to display data.")
-                return
-            
-            # Filter by selected year and quarters
-            year_filtered = filtered_df[filtered_df["Year"] == selected_year]
-            quarter_filtered = year_filtered[year_filtered["Quarter"].isin(selected_quarters)]
-            
-            # Calculate quarterly KPIs based on date-filtered data
-            total_quarterly_budget = quarter_filtered[BUDGET_COLUMNS[str(selected_year)]].sum()
-            total_consumed = quarter_filtered[CONSUMED_COL].sum()
-            total_remaining = quarter_filtered[AVAILABLE_COL].sum()
+	# Render results for each model if available
+	exp1, exp2, exp3 = st.tabs([
+		"Model 1: Minimize Cost",
+		"Model 2: Cost + Max Gap",
+		"Model 3: Cost + Min Gap"
+	])
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric(f"{selected_year} Quarterly Budget", f"{total_quarterly_budget:,.0f}")
-            col2.metric("Total Consumed", f"{total_consumed:,.0f}")
-            col3.metric("Total Remaining", f"{total_remaining:,.0f}")
+	with exp1:
+		res = st.session_state.opt_results.get('m1')
+		if res:
+			c1, c2 = st.columns(2)
+			c1.metric("Total Assigned Hours", f"{res['total_hours']:,.0f}")
+			c2.metric("Total Exact Cost", f"{res['total_cost']:,.2f}")
+			st.dataframe(res['df'], use_container_width=True)
+		else:
+			st.info("Run Model 1 to view results.")
 
-        # ------------------ 📊 Visualizations ------------------
-        st.markdown("---")
-        
-        if time_period == "Annual":
-            st.subheader("📈 Annual Budget Comparison")
-            
-            if selected_cc != "All":
-                # Show multi-year comparison for selected cost center
-                yearly_data = []
-                for year in selected_years:
-                    col_name = BUDGET_COLUMNS[year]
-                    yearly_data.append({
-                        'Year': year,
-                        'Budget': filtered_df[col_name].sum()
-                    })
-                
-                yearly_df = pd.DataFrame(yearly_data)
-                
-                # Create color map for selected years
-                colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-                color_map = {year: colors[i % len(colors)] for i, year in enumerate(selected_years)}
-                
-                fig = px.bar(yearly_df, x='Year', y='Budget', 
-                            title=f"{selected_cc} - Annual Budget by Year",
-                            color='Year', color_discrete_map=color_map)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Add line chart for trend visualization
-                fig_line = px.line(yearly_df, x='Year', y='Budget', 
-                                  title=f"{selected_cc} - Annual Budget Trend",
-                                  markers=True)
-                st.plotly_chart(fig_line, use_container_width=True)
-                
-            else:
-                # Show multi-year comparison for all cost centers
-                yearly_by_cc = []
-                for year in selected_years:
-                    col_name = BUDGET_COLUMNS[year]
-                    year_data = df.groupby("Cost Center Name")[col_name].sum().reset_index()
-                    year_data['Year'] = year
-                    yearly_by_cc.append(year_data)
-                
-                yearly_cc_df = pd.concat(yearly_by_cc, ignore_index=True)
-                
-                # Create color map for selected years
-                colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-                color_map = {year: colors[i % len(colors)] for i, year in enumerate(selected_years)}
-                
-                fig = px.bar(yearly_cc_df, x="Cost Center Name", y=col_name, 
-                            color="Year", barmode="group",
-                            title="Annual Budget by Cost Center and Year",
-                            color_discrete_map=color_map)
-                st.plotly_chart(fig, use_container_width=True)
-        
-        else:
-            st.subheader("📈 Quarterly Budget Analysis")
-            
-            # Filter data for selected year and quarters
-            year_filtered = filtered_df[filtered_df["Year"] == selected_year]
-            quarter_filtered = year_filtered[year_filtered["Quarter"].isin(selected_quarters)]
-            
-            if selected_cc != "All":
-                # Show quarterly comparison for selected cost center
-                quarterly_data = []
-                for quarter in selected_quarters:
-                    quarter_budget = quarter_filtered[quarter_filtered["Quarter"] == quarter][BUDGET_COLUMNS[str(selected_year)]].sum()
-                    quarterly_data.append({
-                        'Quarter': quarter,
-                        'Budget': quarter_budget
-                    })
-                
-                quarterly_df = pd.DataFrame(quarterly_data)
-                
-                # Create color map for quarters
-                quarter_colors = {'Q1': '#1f77b4', 'Q2': '#ff7f0e', 'Q3': '#2ca02c', 'Q4': '#d62728'}
-                
-                fig = px.bar(quarterly_df, x='Quarter', y='Budget', 
-                            title=f"{selected_cc} - {selected_year} Quarterly Budget",
-                            color='Quarter', color_discrete_map=quarter_colors)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Add line chart for quarterly trend
-                fig_line = px.line(quarterly_df, x='Quarter', y='Budget', 
-                                  title=f"{selected_cc} - {selected_year} Quarterly Trend",
-                                  markers=True)
-                st.plotly_chart(fig_line, use_container_width=True)
-                
-            else:
-                # Show quarterly comparison for all cost centers
-                quarterly_by_cc = []
-                for quarter in selected_quarters:
-                    quarter_data = quarter_filtered[quarter_filtered["Quarter"] == quarter].groupby("Cost Center Name")[BUDGET_COLUMNS[str(selected_year)]].sum().reset_index()
-                    quarter_data['Quarter'] = quarter
-                    quarterly_by_cc.append(quarter_data)
-                
-                if quarterly_by_cc:
-                    quarterly_cc_df = pd.concat(quarterly_by_cc, ignore_index=True)
-                    
-                    # Create color map for quarters
-                    quarter_colors = {'Q1': '#1f77b4', 'Q2': '#ff7f0e', 'Q3': '#2ca02c', 'Q4': '#d62728'}
-                    
-                    fig = px.bar(quarterly_cc_df, x="Cost Center Name", y=BUDGET_COLUMNS[str(selected_year)], 
-                                color="Quarter", barmode="group",
-                                title=f"{selected_year} Quarterly Budget by Cost Center",
-                                color_discrete_map=quarter_colors)
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Add heatmap for quarterly visualization
-                    pivot_df = quarterly_cc_df.pivot(index="Cost Center Name", columns="Quarter", values=BUDGET_COLUMNS[str(selected_year)])
-                    fig_heatmap = px.imshow(pivot_df, 
-                                           title=f"{selected_year} Quarterly Budget Heatmap",
-                                           aspect="auto",
-                                           color_continuous_scale="Viridis")
-                    st.plotly_chart(fig_heatmap, use_container_width=True)
+	with exp2:
+		res = st.session_state.opt_results.get('m2')
+		if res:
+			c1, c2, c3 = st.columns(3)
+			c1.metric("Total Assigned Hours", f"{res['total_hours']:,.0f}")
+			c2.metric("Total Exact Cost", f"{res['total_cost']:,.2f}")
+			c3.metric("Range Gap (hrs)", f"{res['gap']:,.0f}")
+			st.caption(f"λ = {res['lambda']}")
+			st.dataframe(res['df'], use_container_width=True)
+		else:
+			st.info("Run Model 2 to view results.")
 
-        st.markdown("---")
-
-        # ------------------ 📊 Additional Charts ------------------
-        if time_period == "Annual" and len(selected_years) == 1:
-            # Single year selected - show traditional charts
-            selected_budget_col = BUDGET_COLUMNS[selected_years[0]]
-            bar_df = filtered_df.groupby("Cost Center Name")[[CONSUMED_COL, AVAILABLE_COL]].sum().reset_index()
-            pie_df = filtered_df.groupby("Cost Center Name")[selected_budget_col].sum().reset_index()
-
-            st.subheader(f"📉 {selected_years[0]} Budget Usage")
-            st.plotly_chart(px.bar(bar_df, x="Cost Center Name", y=[CONSUMED_COL, AVAILABLE_COL],
-                                   barmode="group", title=f"{selected_years[0]} Budget Usage"))
-
-            st.subheader(f"🥧 {selected_years[0]} Budget Breakdown by Cost Center")
-            st.plotly_chart(px.pie(pie_df, names="Cost Center Name", values=selected_budget_col,
-                                   title=f"{selected_years[0]} Budget Share"))
-        
-        elif time_period == "Quarterly":
-            # Quarterly pie chart
-            quarterly_summary = []
-            for quarter in selected_quarters:
-                quarter_budget = quarter_filtered[quarter_filtered["Quarter"] == quarter][BUDGET_COLUMNS[str(selected_year)]].sum()
-                quarterly_summary.append({
-                    'Quarter': quarter,
-                    'Budget': quarter_budget
-                })
-            
-            if quarterly_summary:
-                quarterly_summary_df = pd.DataFrame(quarterly_summary)
-                st.subheader(f"🥧 {selected_year} Quarterly Budget Distribution")
-                st.plotly_chart(px.pie(quarterly_summary_df, names="Quarter", values="Budget",
-                                       title=f"{selected_year} Quarterly Budget Share"))
-
-        # ------------------ 🎯 Filtered Table View ------------------
-        st.subheader("📋 Detailed Data View")
-        
-        if time_period == "Annual":
-            # Show the filtered data with selected years
-            display_columns = [
-                "Cost Center Number", "Cost Center Name", "Account number", "Account name", "Date", "Quarter"
-            ] + [BUDGET_COLUMNS[year] for year in selected_years] + [CONSUMED_COL, AVAILABLE_COL]
-        else:
-            # Show the filtered data with selected quarters
-            display_columns = [
-                "Cost Center Number", "Cost Center Name", "Account number", "Account name", "Date", "Quarter"
-            ] + [BUDGET_COLUMNS[str(selected_year)]] + [CONSUMED_COL, AVAILABLE_COL]
-        
-        # Filter display data based on time period
-        if time_period == "Quarterly":
-            display_df = quarter_filtered
-        else:
-            display_df = filtered_df
-        
-        st.dataframe(display_df[display_columns].reset_index(drop=True), use_container_width=True)
-
-        if selected_cc != "All":
-            # Account-wise breakdown for selected cost center
-            st.subheader(f"📊 {selected_cc} - Account-wise Breakdown")
-            
-            if time_period == "Annual":
-                # Account-wise charts for selected years
-                account_comparison_data = []
-                for year in selected_years:
-                    col_name = BUDGET_COLUMNS[year]
-                    account_data = filtered_df.groupby("Account name")[col_name].sum().reset_index()
-                    account_data['Year'] = year
-                    account_comparison_data.append(account_data)
-                
-                account_comparison_df = pd.concat(account_comparison_data, ignore_index=True)
-                
-                # Create color map for selected years
-                colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
-                color_map = {year: colors[i % len(colors)] for i, year in enumerate(selected_years)}
-                
-                st.plotly_chart(
-                    px.bar(account_comparison_df, x="Account name", y=col_name,
-                           color="Year", barmode="group",
-                           title=f"{selected_cc} - Account-wise Annual Budget Comparison")
-                )
-
-                # Account-wise Table with selected years
-                account_display_cols = ["Account number", "Account name", "Date", "Quarter"] + [BUDGET_COLUMNS[year] for year in selected_years] + [CONSUMED_COL, AVAILABLE_COL]
-                st.dataframe(
-                    filtered_df[account_display_cols].reset_index(drop=True),
-                    use_container_width=True
-                )
-            
-            else:
-                # Account-wise charts for selected quarters
-                account_quarterly_data = []
-                for quarter in selected_quarters:
-                    quarter_account_data = quarter_filtered[quarter_filtered["Quarter"] == quarter].groupby("Account name")[BUDGET_COLUMNS[str(selected_year)]].sum().reset_index()
-                    quarter_account_data['Quarter'] = quarter
-                    account_quarterly_data.append(quarter_account_data)
-                
-                if account_quarterly_data:
-                    account_quarterly_df = pd.concat(account_quarterly_data, ignore_index=True)
-                    
-                    # Create color map for quarters
-                    quarter_colors = {'Q1': '#1f77b4', 'Q2': '#ff7f0e', 'Q3': '#2ca02c', 'Q4': '#d62728'}
-                    
-                    st.plotly_chart(
-                        px.bar(account_quarterly_df, x="Account name", y=BUDGET_COLUMNS[str(selected_year)],
-                               color="Quarter", barmode="group",
-                               title=f"{selected_cc} - Account-wise Quarterly Budget Comparison")
-                    )
-
-                    # Account-wise Table with selected quarters
-                    account_display_cols = ["Account number", "Account name", "Date", "Quarter", BUDGET_COLUMNS[str(selected_year)], CONSUMED_COL, AVAILABLE_COL]
-                    st.dataframe(
-                        quarter_filtered[account_display_cols].reset_index(drop=True),
-                        use_container_width=True
-                    )
-    
-    with tab2:
-        show_summary_tab(df)
+	with exp3:
+		res = st.session_state.opt_results.get('m3')
+		if res:
+			c1, c2, c3 = st.columns(3)
+			c1.metric("Total Assigned Hours", f"{res['total_hours']:,.0f}")
+			c2.metric("Total Exact Cost", f"{res['total_cost']:,.2f}")
+			c3.metric("Range Gap (hrs)", f"{res['gap']:,.0f}")
+			st.caption(f"λ = {res['lambda']}")
+			st.dataframe(res['df'], use_container_width=True)
+		else:
+			st.info("Run Model 3 to view results.")
