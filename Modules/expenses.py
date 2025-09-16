@@ -17,6 +17,17 @@ import seaborn as sns
 import pandas as pd
 from Modules.maintenance import  solve_true_min_cost_mip, solve_true_min_cost_and_min_gap, solve_true_min_cost_and_max_gap
 
+# Import compressor data functions
+try:
+    from Modules.compressor_data import show_compressor_data_entry, show_compressor_data_view
+    COMPRESSOR_MODULE_AVAILABLE = True
+except ImportError as e:
+    COMPRESSOR_MODULE_AVAILABLE = False
+    def show_compressor_data_entry():
+        st.error(f"Compressor data module not available: {e}")
+    def show_compressor_data_view():
+        st.error(f"Compressor data module not available: {e}")
+
 
 
 CURRENT_YEAR = datetime.now().year
@@ -1047,7 +1058,135 @@ def show_summary_tab(df):
             st.warning("📊 Mixed Growth Pattern")
 
 def show_optimizer_dashboard():
+	import os
 	st.title("⚙️ Compressor Optimization")
+	
+	# Simple test to ensure section appears
+	st.write("🔧 **Compressor Data Management**")
+	
+	# Create a simple form directly
+	with st.form("simple_compressor_form"):
+		st.write("**Update Compressor Data**")
+		col1, col2 = st.columns(2)
+		
+		with col1:
+			compressor_id = st.selectbox("Compressor ID", ["A", "B", "C", "D"])
+			compressor_name = st.text_input("Compressor Name", value=f"Compressor {compressor_id}")
+			current_hours = st.number_input("Current Hours", min_value=0, value=500, step=1)
+		
+		with col2:
+			status = st.selectbox("Status", ["Active", "Maintenance", "Inactive", "Repair"])
+			notes = st.text_area("Notes", placeholder="Enter notes here")
+		
+		if st.form_submit_button("Save Data"):
+			# Simple save to Excel
+			try:
+				data = {
+					'Compressor ID': [compressor_id],
+					'Compressor Name': [compressor_name], 
+					'Current Hours': [current_hours],
+					'Date Updated': [datetime.now().date()],
+					'Status': [status],
+					'Notes': [notes]
+				}
+				df_new = pd.DataFrame(data)
+				
+				# Delete the corrupted file if it exists and recreate it
+				if os.path.exists("Data/Compressor_Data.xlsx"):
+					try:
+						df_existing = pd.read_excel("Data/Compressor_Data.xlsx", engine='openpyxl')
+					except:
+						# File is corrupted, delete and recreate
+						os.remove("Data/Compressor_Data.xlsx")
+						# Create initial data
+						initial_data = {
+							'Compressor ID': ['A', 'B', 'C'],
+							'Compressor Name': ['Compressor A', 'Compressor B', 'Compressor C'],
+							'Current Hours': [500, 79300, 76900],
+							'Date Updated': [datetime.now().date()] * 3,
+							'Status': ['Active', 'Active', 'Active'],
+							'Notes': ['Initial setup', 'High usage unit', 'Standard operation']
+						}
+						df_existing = pd.DataFrame(initial_data)
+						df_existing.to_excel("Data/Compressor_Data.xlsx", index=False, engine='openpyxl')
+					
+					# Update if exists, otherwise append
+					if compressor_id in df_existing['Compressor ID'].values:
+						mask = df_existing['Compressor ID'] == compressor_id
+						for key, value in data.items():
+							df_existing.loc[mask, key] = value[0]
+						df_existing.to_excel("Data/Compressor_Data.xlsx", index=False, engine='openpyxl')
+					else:
+						df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+						df_combined.to_excel("Data/Compressor_Data.xlsx", index=False, engine='openpyxl')
+				else:
+					# Create new file with initial data plus new entry
+					initial_data = {
+						'Compressor ID': ['A', 'B', 'C', compressor_id],
+						'Compressor Name': ['Compressor A', 'Compressor B', 'Compressor C', compressor_name],
+						'Current Hours': [500, 79300, 76900, current_hours],
+						'Date Updated': [datetime.now().date()] * 4,
+						'Status': ['Active', 'Active', 'Active', status],
+						'Notes': ['Initial setup', 'High usage unit', 'Standard operation', notes]
+					}
+					df_all = pd.DataFrame(initial_data)
+					df_all.to_excel("Data/Compressor_Data.xlsx", index=False, engine='openpyxl')
+				
+				st.success("✅ Data saved successfully!")
+			except Exception as e:
+				st.error(f"Error saving data: {e}")
+	
+	# Add data viewing section
+	st.markdown("---")
+	st.write("📊 **Current Compressor Data**")
+	
+	try:
+		if os.path.exists("Data/Compressor_Data.xlsx"):
+			df_view = pd.read_excel("Data/Compressor_Data.xlsx", engine='openpyxl')
+			
+			if not df_view.empty:
+				# Display metrics
+				col1, col2, col3, col4 = st.columns(4)
+				with col1:
+					st.metric("Total Compressors", len(df_view))
+				with col2:
+					active_count = len(df_view[df_view['Status'] == 'Active']) if 'Status' in df_view.columns else 0
+					st.metric("Active Units", active_count)
+				with col3:
+					total_hours = df_view['Current Hours'].sum() if 'Current Hours' in df_view.columns else 0
+					st.metric("Total Hours", f"{total_hours:,}")
+				with col4:
+					avg_hours = df_view['Current Hours'].mean() if 'Current Hours' in df_view.columns else 0
+					st.metric("Average Hours", f"{avg_hours:,.0f}")
+				
+				# Display data table
+				st.subheader("📋 Compressor Details")
+				st.dataframe(df_view, use_container_width=True, hide_index=True)
+				
+				# Add status breakdown chart
+				if 'Status' in df_view.columns:
+					st.subheader("📈 Status Distribution")
+					status_counts = df_view['Status'].value_counts()
+					fig = px.pie(values=status_counts.values, names=status_counts.index, 
+								title="Compressor Status Distribution")
+					st.plotly_chart(fig, use_container_width=True)
+				
+				# Add hours comparison chart
+				if 'Current Hours' in df_view.columns and 'Compressor Name' in df_view.columns:
+					st.subheader("⏱️ Operating Hours Comparison")
+					fig = px.bar(df_view, x='Compressor Name', y='Current Hours',
+								title="Current Operating Hours by Compressor",
+								color='Status' if 'Status' in df_view.columns else None)
+					fig.update_layout(xaxis_title="Compressor", yaxis_title="Hours")
+					st.plotly_chart(fig, use_container_width=True)
+			else:
+				st.warning("No compressor data available")
+		else:
+			st.warning("No data file found. Add some compressor data first.")
+	except Exception as e:
+		st.error(f"Error loading data: {e}")
+
+	st.markdown("---")
 
 	# Persist results so multiple runs can be viewed together
 	if 'opt_results' not in st.session_state:
