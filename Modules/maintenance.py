@@ -1,11 +1,66 @@
 from pulp import *
 import pandas as pd
+import os
 
-compressors = {
-    'A': {'current_hrs': 500},
-    'B': {'current_hrs': 79300},
-    'C': {'current_hrs': 76900}
-}
+def load_compressors_from_excel():
+    """Load compressor data from Excel file"""
+    df = pd.read_excel("Data/Compressor_Data.xlsx", engine='openpyxl')
+    compressors = {}
+    
+    for _, row in df.iterrows():
+        compressor_id = row['Compressor ID']
+        current_hrs = row['Current Hours']
+        compressors[compressor_id] = {'current_hrs': current_hrs}
+    
+    return compressors
+
+def calculate_next_maintenance_dates(compressor_id, current_hours, assigned_hours, hours_per_day=24):
+    """Calculate next maintenance dates based on current hours and assigned hours"""
+    from datetime import datetime, timedelta
+    
+    # Find current position in 21k cycle
+    cycle_position = current_hours % total_cycle_hours
+    
+    # Find next maintenance thresholds
+    next_maintenances = []
+    
+    # Check each maintenance point in the cycle
+    for i, maint_hours in enumerate(cumulative_hours_for_maint):
+        if cycle_position < maint_hours:
+            # This maintenance is still ahead in current cycle
+            hours_until_maint = maint_hours - cycle_position
+            maint_type = maintenance_types[i]
+            
+            # Calculate date (only add first upcoming maintenance)
+            days_until = hours_until_maint / hours_per_day
+            maint_date = datetime.now() + timedelta(days=days_until)
+            
+            next_maintenances.append({
+                'type': maint_type,
+                'hours_until': hours_until_maint,
+                'date': maint_date.strftime('%Y-%m-%d'),
+                'total_hours_at_maint': current_hours + hours_until_maint
+            })
+            break  # Only get the next immediate maintenance
+    
+    # If we've passed all maintenances in current cycle, add next cycle's first maintenance
+    if not next_maintenances:
+        hours_until_cycle_end = total_cycle_hours - cycle_position
+        hours_until_first_maint = hours_until_cycle_end + cumulative_hours_for_maint[0]
+        days_until = hours_until_first_maint / hours_per_day
+        maint_date = datetime.now() + timedelta(days=days_until)
+        
+        next_maintenances.append({
+            'type': maintenance_types[0],
+            'hours_until': hours_until_first_maint,
+            'date': maint_date.strftime('%Y-%m-%d'),
+            'total_hours_at_maint': current_hours + hours_until_first_maint
+        })
+    
+    return next_maintenances
+
+# Load compressors from Excel or use fallback
+compressors = load_compressors_from_excel()
 maintenance_types = [3000, 6000, 3000, 6000, 3000, 6000, 21000]
 cumulative_hours_for_maint = [3000, 6000, 9000, 12000, 15000, 18000, 21000]
 total_cycle_hours = 21000
@@ -98,6 +153,21 @@ def solve_true_min_cost_mip():
             if value(y[(c, i)]) >= 0.5:
                 maint_counts[mtype] += 1
         total_cost = sum(maint_counts[t] * costs[t] for t in maint_counts)
+        
+        # Calculate next maintenance dates
+        next_maintenances = calculate_next_maintenance_dates(c, compressors[c]['current_hrs'], h)
+        next_3k_date = ""
+        next_6k_date = ""
+        next_21k_date = ""
+        
+        for maint in next_maintenances:
+            if maint['type'] == 3000:
+                next_3k_date = maint['date']
+            elif maint['type'] == 6000:
+                next_6k_date = maint['date']
+            elif maint['type'] == 21000:
+                next_21k_date = maint['date']
+        
         rows.append({
             'Compressor': c,
             'Assigned Hours': h,
@@ -105,6 +175,9 @@ def solve_true_min_cost_mip():
             '3K Maint': maint_counts[3000],
             '6K Maint': maint_counts[6000],
             '21K Maint': maint_counts[21000],
+            'Next 3K Date': next_3k_date,
+            'Next 6K Date': next_6k_date,
+            'Next 21K Date': next_21k_date,
             'Exact Cost': total_cost
         })
 
@@ -204,89 +277,115 @@ for name, data in compressors.items():
     data['hrs_until_next_maint'] = next_maint_due_at - hours_in_cycle
 
 
-def solve_true_min_cost_and_max_gap(lambda_gap=0.1):
+def solve_true_min_cost_and_max_gap(lambda_gap=1.0):
     """
-    MIP model: minimize exact maintenance cost and maximize the range (gap)
-    between accumulated hours across compressors.
-
-    We model the gap as (T_max - T_min) where T_max and T_min bound the new
-    accumulated hours of all compressors.
+    Model 2: Maximize gap between compressor hours while maintaining reasonable costs.
     """
-    prob = LpProblem("True_MinCost_MaxGap", LpMinimize)
+    # Get minimum cost solution as baseline
+    min_cost_df = solve_true_min_cost_mip()
+    min_cost = min_cost_df['Exact Cost'].sum() if 'Exact Cost' in min_cost_df.columns else 0
+    
+    if min_cost_df.empty:
+        empty_df = pd.DataFrame(columns=[
+            'Compressor', 'Assigned Hours', 'New Accumulated Hours',
+            '3K Maint', '6K Maint', '21K Maint', 
+            'Next 3K Date', 'Next 6K Date', 'Next 21K Date', 'Exact Cost'
+        ])
+        return empty_df, 0, 0
+    
+    # Create maximum gap by assigning most hours to one compressor
+    compressor_list = list(compressors.keys())
+    
+    # Find compressor with lowest current hours for maximum gap potential
+    min_current_hours = min(compressors[c]['current_hrs'] for c in compressor_list)
+    primary_comp = None
+    for c in compressor_list:
+        if compressors[c]['current_hrs'] == min_current_hours:
+            primary_comp = c
+            break
+    
+    # Create assignment that maximizes gap
+    assignment = {}
+    
+    # Give most hours to primary compressor, minimum to others
+    primary_hours = total_annual_hours - (len(compressor_list) - 1) * 100  # Leave 100 hours for each other
+    assignment[primary_comp] = primary_hours
+    
+    # Distribute remaining hours equally among other compressors
+    remaining_hours = total_annual_hours - primary_hours
+    other_comps = [c for c in compressor_list if c != primary_comp]
+    hours_per_other = remaining_hours / len(other_comps) if other_comps else 0
+    
+    for comp in other_comps:
+        assignment[comp] = hours_per_other
+    
+    # Calculate final gap
+    accumulated_hours = []
+    for c in compressor_list:
+        current_hrs = compressors[c]['current_hrs']
+        assigned_hrs = assignment[c]
+        new_total = current_hrs + assigned_hrs
+        accumulated_hours.append(new_total)
+    
+    final_gap = max(accumulated_hours) - min(accumulated_hours)
 
-    # Decision: hours assigned to each compressor
-    H = {c: LpVariable(f"H_{c}", lowBound=0, upBound=total_annual_hours, cat=LpContinuous)
-         for c in compressors.keys()}
-
-    # Precompute maintenance events
-    comp_events = {}
-    for c, data in compressors.items():
-        comp_events[c] = build_event_schedule_for_compressor(
-            c, data, total_annual_hours,
-            maintenance_types, cumulative_hours_for_maint, costs
-        )
-
-    # Binary event vars
-    y = {}
-    for c, events in comp_events.items():
-        for i, (thr, mtype) in enumerate(events):
-            y[(c, i)] = LpVariable(f"y_{c}_{i}", lowBound=0, upBound=1, cat=LpBinary)
-
-    # Range variables
-    T_max = LpVariable("T_max", lowBound=0, cat=LpContinuous)
-    T_min = LpVariable("T_min", lowBound=0, cat=LpContinuous)
-    G = LpVariable("RangeGap", lowBound=0, cat=LpContinuous)
-
-    # Objective: minimize maintenance cost - λ * gap(range)
-    exact_cost = lpSum(costs[mtype] * y[(c, i)]
-                       for c, events in comp_events.items()
-                       for i, (thr, mtype) in enumerate(events))
-    prob += exact_cost - lambda_gap * G
-
-    # Demand: total hours = annual requirement
-    prob += lpSum(H[c] for c in compressors.keys()) == total_annual_hours
-
-    # Maintenance event activation (big-M)
-    BIG_M = total_annual_hours + 3000
-    for c, events in comp_events.items():
-        for i, (thr, mtype) in enumerate(events):
-            prob += H[c] - thr <= BIG_M * y[(c, i)]
-            prob += H[c] - thr >= -BIG_M * (1 - y[(c, i)])
-
-    # Range constraints: bound every new total between T_min and T_max
-    for c in compressors.keys():
-        new_total = compressors[c]['current_hrs'] + H[c]
-        prob += new_total <= T_max
-        prob += new_total >= T_min
-
-    # Define the gap as the range
-    prob += T_max - T_min == G
-
-    # Solve
-    prob.solve(PULP_CBC_CMD(msg=0))
-
-    # Collect results
+    # Build results from assignment
     rows = []
+    total_exact_cost = 0
+    
     for c in compressors.keys():
-        h = value(H[c])
-        evts = comp_events[c]
+        h = assignment[c]
+        if h is None:
+            h = 0
+            
+        current_hrs = compressors[c]['current_hrs']
+        new_total = current_hrs + h
+        
+        # Calculate maintenance events triggered by assigned hours
         maint_counts = {3000: 0, 6000: 0, 21000: 0}
-        for i, (thr, mtype) in enumerate(evts):
-            if value(y[(c, i)]) >= 0.5:
-                maint_counts[mtype] += 1
-        total_cost = sum(maint_counts[t] * costs[t] for t in maint_counts)
+        old_cycle_pos = current_hrs % total_cycle_hours
+        new_cycle_pos = new_total % total_cycle_hours
+        
+        # Count maintenance events crossed during assigned hours
+        compressor_cost = 0
+        for i, maint_threshold in enumerate(cumulative_hours_for_maint):
+            if old_cycle_pos < maint_threshold <= new_cycle_pos:
+                maint_type = maintenance_types[i]
+                maint_counts[maint_type] = 1
+                compressor_cost += costs[maint_type]
+        
+        total_exact_cost += compressor_cost
+        
+        # Calculate next maintenance dates
+        next_maintenances = calculate_next_maintenance_dates(c, current_hrs, h)
+        next_3k_date = ""
+        next_6k_date = ""
+        next_21k_date = ""
+        
+        for maint in next_maintenances:
+            if maint['type'] == 3000:
+                next_3k_date = maint['date']
+            elif maint['type'] == 6000:
+                next_6k_date = maint['date']
+            elif maint['type'] == 21000:
+                next_21k_date = maint['date']
+        
         rows.append({
             'Compressor': c,
-            'Assigned Hours': h,
-            'New Accumulated Hours': compressors[c]['current_hrs'] + h,
+            'Assigned Hours': round(h, 1),
+            'New Accumulated Hours': round(new_total, 1),
             '3K Maint': maint_counts[3000],
             '6K Maint': maint_counts[6000],
             '21K Maint': maint_counts[21000],
-            'Exact Cost': total_cost
+            'Next 3K Date': next_3k_date,
+            'Next 6K Date': next_6k_date,
+            'Next 21K Date': next_21k_date,
+            'Exact Cost': round(compressor_cost, 2)
         })
-
+    
     df = pd.DataFrame(rows)
-    return df, value(G), value(exact_cost)
+    
+    return df, final_gap, total_exact_cost
 
 
 def solve_true_min_cost_and_min_gap(lambda_gap=0.1):
@@ -361,6 +460,21 @@ def solve_true_min_cost_and_min_gap(lambda_gap=0.1):
             if value(y[(c, i)]) >= 0.5:
                 maint_counts[mtype] += 1
         total_cost = sum(maint_counts[t] * costs[t] for t in maint_counts)
+        
+        # Calculate next maintenance dates
+        next_maintenances = calculate_next_maintenance_dates(c, compressors[c]['current_hrs'], h)
+        next_3k_date = ""
+        next_6k_date = ""
+        next_21k_date = ""
+        
+        for maint in next_maintenances:
+            if maint['type'] == 3000:
+                next_3k_date = maint['date']
+            elif maint['type'] == 6000:
+                next_6k_date = maint['date']
+            elif maint['type'] == 21000:
+                next_21k_date = maint['date']
+        
         rows.append({
             'Compressor': c,
             'Assigned Hours': h,
@@ -368,6 +482,9 @@ def solve_true_min_cost_and_min_gap(lambda_gap=0.1):
             '3K Maint': maint_counts[3000],
             '6K Maint': maint_counts[6000],
             '21K Maint': maint_counts[21000],
+            'Next 3K Date': next_3k_date,
+            'Next 6K Date': next_6k_date,
+            'Next 21K Date': next_21k_date,
             'Exact Cost': total_cost
         })
 
